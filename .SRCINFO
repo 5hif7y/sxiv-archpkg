@@ -1,0 +1,17 @@
+pkgbase = sxiv
+	pkgdesc = Simple X Image Viewer
+	pkgver = 26
+	pkgrel = 2
+	url = https://github.com/muennich/sxiv
+	arch = x86_64
+	license = GPL2
+	depends = imlib2
+	depends = desktop-file-utils
+	depends = xdg-utils
+	depends = hicolor-icon-theme
+	depends = libexif
+	depends = libxft
+	source = sxiv-26.tar.gz::https://github.com/muennich/sxiv/archive/v26.tar.gz
+	sha256sums = a382ad57734243818e828ba161fc0357b48d8f3a7f8c29cac183492b46b58949
+
+pkgname = sxiv
