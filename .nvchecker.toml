@@ -1,0 +1,4 @@
+[sxiv]
+source = "git"
+git = "https://github.com/muennich/sxiv.git"
+prefix = "v"
