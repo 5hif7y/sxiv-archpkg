@@ -1,0 +1,396 @@
+From 84166b8456110dfd740a8e5ddc3f81d2c37e22b5 Mon Sep 17 00:00:00 2001
+From: 5hif7y <44300833+5hif7y@users.noreply.github.com>
+Date: Fri, 4 Sep 2026 04:07:14 -0300
+Subject: [PATCH] Decouple libXft in favor of FreeType2 and Fontconfig
+
+---
+ Makefile |   2 +-
+ sxiv.h   |  11 ++-
+ window.c | 269 ++++++++++++++++++++++++++++++++++++++++++++++---------
+ 3 files changed, 234 insertions(+), 48 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index da6c209..7e3953e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -24,7 +24,7 @@ lib_exif_0 =
+ lib_exif_1 = -lexif
+ lib_gif_0 =
+ lib_gif_1 = -lgif
+-ldlibs = $(LDLIBS) -lImlib2 -lX11 -lXft -lfontconfig \
++ldlibs = $(LDLIBS) -lImlib2 -lX11 -lfreetype -lfontconfig \
+   $(lib_exif_$(HAVE_LIBEXIF)) $(lib_gif_$(HAVE_GIFLIB))
+ 
+ objs = autoreload_$(AUTORELOAD).o commands.o image.o main.o options.o \
+diff --git a/sxiv.h b/sxiv.h
+index 707eba7..c1b232d 100644
+--- a/sxiv.h
++++ b/sxiv.h
+@@ -371,7 +371,12 @@ int r_mkdir(char*);
+ /* window.c */
+ 
+ #include <X11/Xutil.h>
+-#include <X11/Xft/Xft.h>
++#include <stdint.h>
++
++typedef struct {
++	unsigned long pixel;
++	uint8_t r, g, b;
++} win_color_t;
+ 
+ enum {
+ 	BAR_L_LEN = 512,
+@@ -407,8 +412,8 @@ struct win {
+ 	Window xwin;
+ 	win_env_t env;
+ 
+-	XftColor bg;
+-	XftColor fg;
++	win_color_t bg;
++	win_color_t fg;
+ 
+ 	int x;
+ 	int y;
+diff --git a/window.c b/window.c
+index 6f9a390..5bee599 100644
+--- a/window.c
++++ b/window.c
+@@ -46,29 +46,115 @@ static struct {
+ 
+ static GC gc;
+ 
+-static XftFont *font;
++#include <ft2build.h>
++#include FT_FREETYPE_H
++#include <fontconfig/fontconfig.h>
++
++typedef struct {
++	FT_Face face;
++	int ascent;
++	int descent;
++	int height;
++} font_t;
++
++static FT_Library ftlib;
++static font_t font;
+ static int fontheight;
+ static double fontsize;
+ static int barheight;
+ 
+ Atom atoms[ATOM_COUNT];
+ 
++static bool open_font_pattern(FcPattern *pat, font_t *f)
++{
++	FcPattern *match;
++	FcResult res;
++	FcChar8 *file = NULL;
++	int index = 0;
++	double size = 0.0;
++
++	FcConfigSubstitute(NULL, pat, FcMatchPattern);
++	FcDefaultSubstitute(pat);
++	match = FcFontMatch(NULL, pat, &res);
++	if (!match)
++		return false;
++
++	if (FcPatternGetString(match, FC_FILE, 0, &file) != FcResultMatch || file == NULL) {
++		FcPatternDestroy(match);
++		return false;
++	}
++	FcPatternGetInteger(match, FC_INDEX, 0, &index);
++	if (FcPatternGetDouble(match, FC_PIXEL_SIZE, 0, &size) != FcResultMatch) {
++		if (FcPatternGetDouble(match, FC_SIZE, 0, &size) == FcResultMatch)
++			size = size * 96.0 / 72.0;
++		else
++			size = 12.0;
++	}
++
++	if (FT_New_Face(ftlib, (const char *)file, index, &f->face) != 0) {
++		FcPatternDestroy(match);
++		return false;
++	}
++
++	if (FT_Set_Pixel_Sizes(f->face, 0, (FT_UInt)size) != 0) {
++		if (f->face->num_fixed_sizes > 0)
++			FT_Select_Size(f->face, 0);
++	}
++
++	f->ascent = f->face->size->metrics.ascender >> 6;
++	f->descent = -(f->face->size->metrics.descender >> 6);
++	f->height = f->face->size->metrics.height >> 6;
++	if (f->height < f->ascent + f->descent)
++		f->height = f->ascent + f->descent;
++
++	FcPatternDestroy(match);
++	return true;
++}
++
+ void win_init_font(const win_env_t *e, const char *fontstr)
+ {
+-	if ((font = XftFontOpenName(e->dpy, e->scr, fontstr)) == NULL)
++	FcPattern *pat;
++
++	if (FT_Init_FreeType(&ftlib) != 0)
++		error(EXIT_FAILURE, 0, "Error initializing FreeType library");
++
++	if (!FcInit())
++		error(EXIT_FAILURE, 0, "Error initializing Fontconfig");
++
++	if ((pat = FcNameParse((const FcChar8*)fontstr)) == NULL)
++		error(EXIT_FAILURE, 0, "Error parsing font name '%s'", fontstr);
++
++	if (FcPatternGetDouble(pat, FC_SIZE, 0, &fontsize) != FcResultMatch) {
++		if (FcPatternGetDouble(pat, FC_PIXEL_SIZE, 0, &fontsize) != FcResultMatch)
++			fontsize = 8.0;
++	}
++
++	if (!open_font_pattern(pat, &font)) {
++		FcPatternDestroy(pat);
+ 		error(EXIT_FAILURE, 0, "Error loading font '%s'", fontstr);
+-	fontheight = font->ascent + font->descent;
+-	FcPatternGetDouble(font->pattern, FC_SIZE, 0, &fontsize);
++	}
++	FcPatternDestroy(pat);
++
++	fontheight = font.ascent + font.descent;
+ 	barheight = fontheight + 2 * V_TEXT_PAD;
+ }
+ 
+-void win_alloc_color(const win_env_t *e, const char *name, XftColor *col)
++void win_alloc_color(const win_env_t *e, const char *name, win_color_t *col)
+ {
+-	if (!XftColorAllocName(e->dpy, DefaultVisual(e->dpy, e->scr),
+-	                       DefaultColormap(e->dpy, e->scr), name, col))
+-	{
+-		error(EXIT_FAILURE, 0, "Error allocating color '%s'", name);
++	XColor exact, screen;
++
++	if (!XAllocNamedColor(e->dpy, e->cmap, name, &screen, &exact)) {
++		if (!XParseColor(e->dpy, e->cmap, name, &exact) ||
++		    !XAllocColor(e->dpy, e->cmap, &exact))
++		{
++			error(EXIT_FAILURE, 0, "Error allocating color '%s'", name);
++		}
++		screen = exact;
+ 	}
++	col->pixel = screen.pixel;
++	col->r = screen.red >> 8;
++	col->g = screen.green >> 8;
++	col->b = screen.blue >> 8;
+ }
+ 
+ const char* win_res(XrmDatabase db, const char *name, const char *def)
+@@ -280,6 +366,12 @@ CLEANUP void win_close(win_t *win)
+ 
+ 	XDestroyWindow(win->env.dpy, win->xwin);
+ 	XCloseDisplay(win->env.dpy);
++
++	if (font.face)
++		FT_Done_Face(font.face);
++	if (ftlib)
++		FT_Done_FreeType(ftlib);
++	FcFini();
+ }
+ 
+ bool win_configure(win_t *win, XConfigureEvent *c)
+@@ -347,36 +439,114 @@ void win_clear(win_t *win)
+ #define TEXTWIDTH(win, text, len) \
+ 	win_draw_text(win, NULL, NULL, 0, 0, text, len, 0)
+ 
+-int win_draw_text(win_t *win, XftDraw *d, const XftColor *color, int x, int y,
++static inline unsigned long blend_pixel(const win_env_t *e, unsigned long bg_pix,
++                                       const win_color_t *fg_col, uint8_t a)
++{
++	if (a == 0)
++		return bg_pix;
++	if (a == 255)
++		return fg_col->pixel;
++
++	if (e->vis->red_mask == 0xff0000 && e->vis->green_mask == 0xff00 && e->vis->blue_mask == 0xff) {
++		uint32_t bg_r = (bg_pix >> 16) & 0xFF;
++		uint32_t bg_g = (bg_pix >> 8) & 0xFF;
++		uint32_t bg_b = bg_pix & 0xFF;
++
++		uint32_t r = (fg_col->r * a + bg_r * (255 - a)) / 255;
++		uint32_t g = (fg_col->g * a + bg_g * (255 - a)) / 255;
++		uint32_t b = (fg_col->b * a + bg_b * (255 - a)) / 255;
++
++		return (r << 16) | (g << 8) | b;
++	} else {
++		unsigned long rm = e->vis->red_mask;
++		unsigned long gm = e->vis->green_mask;
++		unsigned long bm = e->vis->blue_mask;
++
++		int rs = rm ? __builtin_ctzl(rm) : 0;
++		int gs = gm ? __builtin_ctzl(gm) : 0;
++		int bs = bm ? __builtin_ctzl(bm) : 0;
++
++		uint32_t bg_r = (bg_pix & rm) >> rs;
++		uint32_t bg_g = (bg_pix & gm) >> gs;
++		uint32_t bg_b = (bg_pix & bm) >> bs;
++
++		uint32_t r = (fg_col->r * a + bg_r * (255 - a)) / 255;
++		uint32_t g = (fg_col->g * a + bg_g * (255 - a)) / 255;
++		uint32_t b = (fg_col->b * a + bg_b * (255 - a)) / 255;
++
++		return ((r << rs) & rm) | ((g << gs) & gm) | ((b << bs) & bm);
++	}
++}
++
++int win_draw_text(win_t *win, XImage *bar_img, const win_color_t *color, int x, int y,
+                   char *text, int len, int w)
+ {
+ 	int err, tw = 0;
+ 	char *t, *next;
+ 	uint32_t rune;
+-	XftFont *f;
+-	FcCharSet *fccharset;
+-	XGlyphInfo ext;
++	font_t *f, fallback_font;
++	bool is_fallback;
+ 
+ 	for (t = text; t - text < len; t = next) {
+ 		next = utf8_decode(t, &rune, &err);
+-		if (XftCharExists(win->env.dpy, font, rune)) {
+-			f = font;
+-		} else { /* fallback font */
+-			fccharset = FcCharSetCreate();
+-			FcCharSetAddChar(fccharset, rune);
+-			f = XftFontOpen(win->env.dpy, win->env.scr, FC_CHARSET, FcTypeCharSet,
+-			                fccharset, FC_SCALABLE, FcTypeBool, FcTrue,
+-			                FC_SIZE, FcTypeDouble, fontsize, NULL);
+-			FcCharSetDestroy(fccharset);
++		is_fallback = false;
++		f = &font;
++
++		FT_UInt glyph_index = FT_Get_Char_Index(font.face, rune);
++		if (glyph_index == 0) {
++			FcPattern *pat = FcPatternCreate();
++			FcCharSet *fcs = FcCharSetCreate();
++			FcCharSetAddChar(fcs, rune);
++			FcPatternAddCharSet(pat, FC_CHARSET, fcs);
++			FcPatternAddBool(pat, FC_SCALABLE, FcTrue);
++			FcPatternAddDouble(pat, FC_SIZE, fontsize);
++			if (open_font_pattern(pat, &fallback_font)) {
++				f = &fallback_font;
++				is_fallback = true;
++				glyph_index = FT_Get_Char_Index(f->face, rune);
++			}
++			FcCharSetDestroy(fcs);
++			FcPatternDestroy(pat);
+ 		}
+-		XftTextExtentsUtf8(win->env.dpy, f, (XftChar8*)t, next - t, &ext);
+-		tw += ext.xOff;
+-		if (tw <= w) {
+-			XftDrawStringUtf8(d, color, f, x, y, (XftChar8*)t, next - t);
+-			x += ext.xOff;
++
++		if (FT_Load_Glyph(f->face, glyph_index, bar_img != NULL ? FT_LOAD_RENDER : FT_LOAD_DEFAULT) != 0) {
++			if (is_fallback)
++				FT_Done_Face(fallback_font.face);
++			continue;
++		}
++
++		int advance = (f->face->glyph->advance.x + 32) >> 6;
++		tw += advance;
++
++		if (bar_img != NULL && tw <= w) {
++			FT_GlyphSlot slot = f->face->glyph;
++			FT_Bitmap *bm = &slot->bitmap;
++			int gx = x + slot->bitmap_left;
++			int gy = y - slot->bitmap_top;
++
++			for (int row = 0; row < (int)bm->rows; row++) {
++				int py = gy + row;
++				if (py < 0 || py >= (int)win->bar.h)
++					continue;
++				for (int col = 0; col < (int)bm->width; col++) {
++					int px = gx + col;
++					if (px < 0 || px >= (int)win->w)
++						continue;
++
++					uint8_t alpha = bm->buffer[row * bm->pitch + col];
++					if (alpha == 0)
++						continue;
++
++					unsigned long bg_pix = XGetPixel(bar_img, px, py);
++					unsigned long blended = blend_pixel(&win->env, bg_pix, color, alpha);
++					XPutPixel(bar_img, px, py, blended);
++				}
++			}
++			x += advance;
+ 		}
+-		if (f != font)
+-			XftFontClose(win->env.dpy, f);
++
++		if (is_fallback)
++			FT_Done_Face(fallback_font.face);
+ 	}
+ 	return tw;
+ }
+@@ -386,36 +556,47 @@ void win_draw_bar(win_t *win)
+ 	int len, x, y, w, tw;
+ 	win_env_t *e;
+ 	win_bar_t *l, *r;
+-	XftDraw *d;
++	XImage *bar_img;
++	char *img_data;
+ 
+ 	if ((l = &win->bar.l)->buf == NULL || (r = &win->bar.r)->buf == NULL)
+ 		return;
+ 
+ 	e = &win->env;
+-	y = win->h + font->ascent + V_TEXT_PAD;
+-	w = win->w - 2*H_TEXT_PAD;
+-	d = XftDrawCreate(e->dpy, win->buf.pm, DefaultVisual(e->dpy, e->scr),
+-	                  DefaultColormap(e->dpy, e->scr));
+-
+-	XSetForeground(e->dpy, gc, win->fg.pixel);
+-	XFillRectangle(e->dpy, win->buf.pm, gc, 0, win->h, win->w, win->bar.h);
+-
+-	XSetForeground(e->dpy, gc, win->bg.pixel);
+-	XSetBackground(e->dpy, gc, win->fg.pixel);
++	y = font.ascent + V_TEXT_PAD;
++	w = win->w - 2 * H_TEXT_PAD;
+ 
+ 	if ((len = strlen(r->buf)) > 0) {
+-		if ((tw = TEXTWIDTH(win, r->buf, len)) > w)
++		tw = TEXTWIDTH(win, r->buf, len);
++		if (tw > w)
+ 			return;
++	} else {
++		tw = 0;
++	}
++
++	img_data = emalloc(win->w * win->bar.h * 4);
++	bar_img = XCreateImage(e->dpy, e->vis, e->depth, ZPixmap, 0,
++	                       img_data, win->w, win->bar.h, 32, 0);
++
++	for (unsigned int py = 0; py < win->bar.h; py++) {
++		for (unsigned int px = 0; px < win->w; px++) {
++			XPutPixel(bar_img, px, py, win->fg.pixel);
++		}
++	}
++
++	if (len > 0) {
+ 		x = win->w - tw - H_TEXT_PAD;
+ 		w -= tw;
+-		win_draw_text(win, d, &win->bg, x, y, r->buf, len, tw);
++		win_draw_text(win, bar_img, &win->bg, x, y, r->buf, len, tw);
+ 	}
+ 	if ((len = strlen(l->buf)) > 0) {
+ 		x = H_TEXT_PAD;
+ 		w -= 2 * H_TEXT_PAD; /* gap between left and right parts */
+-		win_draw_text(win, d, &win->bg, x, y, l->buf, len, w);
++		win_draw_text(win, bar_img, &win->bg, x, y, l->buf, len, w);
+ 	}
+-	XftDrawDestroy(d);
++
++	XPutImage(e->dpy, win->buf.pm, gc, bar_img, 0, 0, 0, win->h, win->w, win->bar.h);
++	XDestroyImage(bar_img);
+ }
+ 
+ void win_draw(win_t *win)
+-- 
+2.55.0
+
